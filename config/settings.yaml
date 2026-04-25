@@ -1,0 +1,80 @@
+# ── Bot configuration ──────────────────────────────────────────────────────────
+# Edit this file to tune parameters. Keep secrets in .env (never here).
+
+mode: collect          # collect | backtest | dryrun | live
+
+# ── Markets to track/trade ─────────────────────────────────────────────────────
+assets:
+  - symbol: BTC
+    binance_pair: BTCUSDT
+    enabled: true
+  - symbol: ETH
+    binance_pair: ETHUSDT
+    enabled: true
+
+# Only trade markets matching these durations (minutes)
+market_durations: [15, 5]
+
+# ── Fair value model ───────────────────────────────────────────────────────────
+fair_value:
+  vol_window_minutes: 60        # rolling window for realized vol
+  vol_min_periods: 12           # require at least N data points
+  momentum_window_seconds: 300  # window for momentum signal
+  momentum_weight: 0.3          # how much to adjust fair for momentum
+
+# ── Quote engine ───────────────────────────────────────────────────────────────
+quoting:
+  base_half_spread: 0.020       # 2.0 cents base spread on each side
+  vol_spread_scale: 2.0         # multiply annualized vol by this to get extra spread
+  min_half_spread: 0.015        # never quote tighter than 1.5 cents
+  max_half_spread: 0.100        # never quote wider than 10 cents
+  inventory_skew_per_unit: 0.005 # widen spread by 0.5¢ per $1 of net inventory
+  stop_quoting_seconds: 60      # stop quoting this many seconds before expiry
+  widen_near_expiry_seconds: 120 # start widening spread this many seconds before expiry
+
+# ── Preemptive cancel ──────────────────────────────────────────────────────────
+cancel:
+  spot_move_threshold_bps: 15   # cancel all orders if spot moves > 15bps since last quote
+  cancel_on_vol_spike: true
+  vol_spike_multiplier: 2.0     # cancel if realized vol > 2x rolling average
+
+# ── Risk limits ────────────────────────────────────────────────────────────────
+risk:
+  max_order_size_usdc: 5.0          # max single order (Phase 6 tiny live)
+  max_market_exposure_usdc: 25.0    # max net exposure per market
+  max_total_exposure_usdc: 100.0    # max across all markets
+  max_daily_loss_usdc: 50.0         # kill switch: stop trading for the day
+  max_net_delta_usdc: 20.0          # trigger delta warning above this
+  max_adverse_selection_rate: 0.50  # kill switch: stop if >50% fills are adverse
+
+# ── Execution ──────────────────────────────────────────────────────────────────
+execution:
+  dry_run: true          # set to false for live trading
+  order_type: GTC        # GTC = Good-Till-Cancelled
+  post_only: true        # only maker orders (never taker)
+
+# ── Database ───────────────────────────────────────────────────────────────────
+database:
+  batch_write_size: 100          # buffer ticks before bulk insert
+  batch_write_interval_ms: 500
+
+# ── Polymarket API ─────────────────────────────────────────────────────────────
+polymarket:
+  clob_api_url: https://clob.polymarket.com
+  gamma_api_url: https://gamma-api.polymarket.com
+  ws_url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  market_refresh_interval_seconds: 60
+  min_market_volume_24h: 500     # skip illiquid markets below this USDC volume
+  # Resolution oracle expected for 5m/15m BTC/ETH Up/Down markets (verify per market!)
+  expected_oracle: chainlink     # chainlink | binance | pyth | any
+
+# ── Binance ────────────────────────────────────────────────────────────────────
+binance:
+  ws_base: wss://stream.binance.com:9443/stream
+  orderbook_depth: 5             # L2 levels to subscribe (5 is sufficient for microprice)
+  reconnect_delay_seconds: 5
+
+# ── Alerting ───────────────────────────────────────────────────────────────────
+alerting:
+  telegram_enabled: false
+  kill_switch_notify: true
