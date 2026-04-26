@@ -77,8 +77,8 @@ def check_config(path: str) -> bool:
     checks = [
         ("signal.order_size_usdc", float(signal.get("order_size_usdc", 0)), 2.0),
         ("risk.max_order_size_usdc", float(risk.get("max_order_size_usdc", 0)), 2.0),
-        ("risk.max_total_exposure_usdc", float(risk.get("max_total_exposure_usdc", 0)), 20.0),
-        ("risk.max_daily_loss_usdc", float(risk.get("max_daily_loss_usdc", 0)), 15.0),
+        ("risk.max_total_exposure_usdc", float(risk.get("max_total_exposure_usdc", 0)), 10.0),
+        ("risk.max_daily_loss_usdc", float(risk.get("max_daily_loss_usdc", 0)), 7.0),
     ]
     for name, actual, expected in checks:
         if actual <= expected:

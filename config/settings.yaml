@@ -65,9 +65,9 @@ cancel:
 risk:
   max_order_size_usdc: 2.0          # max single order for initial live trial
   max_market_exposure_usdc: 3.0     # max net exposure per market
-  max_total_exposure_usdc: 20.0     # total starter bankroll exposure cap
-  max_daily_loss_usdc: 15.0         # kill switch: stop trading for the day
-  max_net_delta_usdc: 10.0          # trigger delta warning above this
+  max_total_exposure_usdc: 10.0     # total starter bankroll exposure cap
+  max_daily_loss_usdc: 7.0          # kill switch: stop trading for the day
+  max_net_delta_usdc: 6.0           # trigger delta warning above this
   max_adverse_selection_rate: 0.50  # kill switch: stop if >50% fills are adverse
 
 # ── Execution ──────────────────────────────────────────────────────────────────
