@@ -3,6 +3,12 @@
 
 mode: collect          # collect | backtest | dryrun | live
 
+# Trading strategy:
+#   market_making = quote bid/ask around fair value
+#   signal        = buy only when model fair probability beats executable ask
+strategy:
+  mode: signal         # market_making | signal
+
 # ── Markets to track/trade ─────────────────────────────────────────────────────
 assets:
   - symbol: BTC
@@ -22,6 +28,23 @@ fair_value:
   momentum_window_seconds: 300  # window for momentum signal
   momentum_weight: 0.3          # how much to adjust fair for momentum
 
+# ── Directional value signal ──────────────────────────────────────────────────
+# Used only when strategy.mode: signal. In live mode, taker-style entry is
+# blocked unless allow_taker is explicitly set to true.
+signal:
+  enabled: true
+  allow_taker: false             # live safety guard; dryrun still logs synthetic orders
+  min_edge: 0.040                # fair probability must beat ask by at least 4 cents
+  min_probability: 0.550         # avoid low-conviction entries even if price is cheap
+  max_entry_price: 0.950         # avoid paying near-certain prices with poor payoff
+  min_seconds_to_expiry: 60      # avoid oracle/latency noise at the end
+  max_seconds_to_expiry: 900     # ignore markets too far from settlement
+  min_ask_size_usdc: 1.0
+  order_size_usdc: 2.0           # starter real-money size: $2 per signal
+  cooldown_seconds: 20
+  one_position_per_market: true
+  trade_sides: [UP, DOWN]
+
 # ── Quote engine ───────────────────────────────────────────────────────────────
 quoting:
   base_half_spread: 0.020       # 2.0 cents base spread on each side
@@ -40,11 +63,11 @@ cancel:
 
 # ── Risk limits ────────────────────────────────────────────────────────────────
 risk:
-  max_order_size_usdc: 5.0          # max single order (Phase 6 tiny live)
-  max_market_exposure_usdc: 25.0    # max net exposure per market
-  max_total_exposure_usdc: 100.0    # max across all markets
-  max_daily_loss_usdc: 50.0         # kill switch: stop trading for the day
-  max_net_delta_usdc: 20.0          # trigger delta warning above this
+  max_order_size_usdc: 2.0          # max single order for initial live trial
+  max_market_exposure_usdc: 3.0     # max net exposure per market
+  max_total_exposure_usdc: 20.0     # total starter bankroll exposure cap
+  max_daily_loss_usdc: 15.0         # kill switch: stop trading for the day
+  max_net_delta_usdc: 10.0          # trigger delta warning above this
   max_adverse_selection_rate: 0.50  # kill switch: stop if >50% fills are adverse
 
 # ── Execution ──────────────────────────────────────────────────────────────────

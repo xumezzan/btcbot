@@ -32,7 +32,7 @@ class MarketPosition:
 
     @property
     def gross_exposure_usdc(self) -> float:
-        return abs(self.up_shares) + abs(self.down_shares)
+        return abs(self.up_shares * self.avg_up_price) + abs(self.down_shares * self.avg_down_price)
 
 
 class InventoryManager:

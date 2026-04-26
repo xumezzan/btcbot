@@ -114,21 +114,35 @@ class CLOBClient:
     ) -> Optional[Order]:
         """
         Post a limit order. Returns Order if accepted.
+        For BUY orders, size_usdc is a max USDC budget and is converted to
+        outcome-token shares because Polymarket's CLOB order size is shares.
+        For SELL orders, size_usdc is treated as shares to sell.
         In dry-run mode, creates a synthetic order.
         """
         order_id = str(uuid.uuid4())
         ts = int(time.time() * 1000)
+        side = side.upper()
+        price = round(float(price), 4)
+        if price <= 0:
+            log.error("Refusing order with invalid price %.4f", price)
+            return None
+
+        size_shares = float(size_usdc)
+        cost_usdc = size_shares * price
+        if side == "BUY":
+            cost_usdc = float(size_usdc)
+            size_shares = cost_usdc / price
 
         if self._dry_run:
-            log.info("[DRY-RUN] POST ORDER %s %s token=%s price=%.4f size=$%.2f",
-                     side, market_id[:12], token_id[:12], price, size_usdc)
+            log.info("[DRY-RUN] POST ORDER %s %s token=%s price=%.4f shares=%.4f cost=$%.2f",
+                     side, market_id[:12], token_id[:12], price, size_shares, cost_usdc)
             order = Order(
                 order_id=order_id,
                 market_id=market_id,
                 token_id=token_id,
                 side=side,
                 price=price,
-                size=size_usdc,
+                size=size_shares,
                 status="OPEN",
                 ts_ms=ts,
             )
@@ -141,7 +155,7 @@ class CLOBClient:
             args = OrderArgs(
                 token_id=token_id,
                 price=price,
-                size=size_usdc,
+                size=size_shares,
                 side=side,
                 order_type=OrderType.GTC,
             )
@@ -153,12 +167,13 @@ class CLOBClient:
                 token_id=token_id,
                 side=side,
                 price=price,
-                size=size_usdc,
+                size=size_shares,
                 status="OPEN",
                 ts_ms=ts,
             )
             self._open_orders[order_id] = order
-            log.info("Posted order %s %s price=%.4f size=%.2f", side, order_id[:8], price, size_usdc)
+            log.info("Posted order %s %s price=%.4f shares=%.4f cost=$%.2f",
+                     side, order_id[:8], price, size_shares, cost_usdc)
             return order
         except Exception as exc:
             log.error("Failed to post order: %s", exc)
@@ -227,6 +242,65 @@ class CLOBClient:
         except Exception as exc:
             log.error("get_open_orders failed: %s", exc)
             return []
+
+    async def get_user_fills(self, market_id: str | None = None, after_ts_ms: int | None = None) -> list[Fill]:
+        """
+        Fetch authenticated user trade history from the CLOB API.
+
+        This is read-only and returns only trades for the configured API key.
+        Polymarket's TradeParams after/before fields are timestamp filters; use
+        seconds to match the SDK/API convention.
+        """
+        if self._dry_run:
+            return list(self._dry_run_fills)
+
+        try:
+            from py_clob_client.clob_types import TradeParams
+
+            params = TradeParams(
+                market=market_id,
+                after=(after_ts_ms // 1000) if after_ts_ms else None,
+            )
+            raw = await asyncio.to_thread(self._client.get_trades, params)
+            fills: list[Fill] = []
+            for r in raw or []:
+                ts_raw = r.get("timestamp") or r.get("created_at") or r.get("createdAt") or 0
+                try:
+                    ts_ms = int(float(ts_raw) * 1000)
+                except (TypeError, ValueError):
+                    ts_ms = int(time.time() * 1000)
+
+                fills.append(Fill(
+                    fill_id=str(r.get("id") or r.get("trade_id") or r.get("transactionHash") or ""),
+                    order_id=str(r.get("order_id") or r.get("orderId") or ""),
+                    market_id=str(r.get("market") or r.get("condition_id") or r.get("conditionId") or ""),
+                    token_id=str(r.get("asset_id") or r.get("assetId") or r.get("token_id") or ""),
+                    side=str(r.get("side") or ""),
+                    price=float(r.get("price") or 0),
+                    size=float(r.get("size") or 0),
+                    fee=float(r.get("fee") or 0),
+                    ts_ms=ts_ms,
+                ))
+            return fills
+        except Exception as exc:
+            log.error("get_user_fills failed: %s", exc)
+            return []
+
+    async def get_balance_allowance(self) -> dict:
+        """Fetch authenticated collateral balance/allowance from the CLOB API."""
+        if self._dry_run:
+            return {"balance": "0", "allowances": {}}
+
+        try:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+            return await asyncio.to_thread(
+                self._client.get_balance_allowance,
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+            )
+        except Exception as exc:
+            log.error("get_balance_allowance failed: %s", exc)
+            return {}
 
     async def redeem_position(self, condition_id: str) -> bool:
         """

@@ -273,8 +273,10 @@ class MarketDiscovery:
 
     async def run(self) -> None:
         import aiohttp
+        from src.net.ssl import create_ssl_context
 
-        async with aiohttp.ClientSession() as session:
+        connector = aiohttp.TCPConnector(ssl=create_ssl_context())
+        async with aiohttp.ClientSession(connector=connector) as session:
             while True:
                 await self._refresh(session)
                 await asyncio.sleep(self._refresh_interval)

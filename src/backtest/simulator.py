@@ -65,14 +65,17 @@ class Simulator:
         from src.quoting.quote_engine import QuoteEngine
         from src.quoting.inventory import InventoryManager
         from src.markets.lifecycle import classify, seconds_to_expiry
+        from src.signals.value_signal import MarketPrices, OutcomeQuote, ValueSignalEngine
 
         model = FairValueModel(self._cfg.get("fair_value", {}))
         vol_calc = RealizedVolatility(
             window_minutes=self._cfg.get("fair_value", {}).get("vol_window_minutes", 60)
         )
         quote_engine = QuoteEngine(self._cfg.get("quoting", {}))
+        signal_engine = ValueSignalEngine(self._cfg.get("signal", {}))
         inventory = InventoryManager()
         result = SimResult()
+        strategy_mode = self._cfg.get("strategy", {}).get("mode", "market_making")
 
         # Load spot ticks
         spot_ticks = await self._load_spot_ticks(start_date, end_date, f"{symbol}USDT")
@@ -110,6 +113,7 @@ class Simulator:
 
         # Advance CLOB pointer per market
         clob_ptrs: dict[str, int] = {mid: 0 for mid in clob_by_market}
+        latest_prices: dict[str, dict[str, OutcomeQuote]] = {}
 
         for tick in spot_ticks:
             ts_ms = tick["ts_ms"]
@@ -143,15 +147,23 @@ class Simulator:
                         pnl -= GAS_FEE
                         del virtual_orders[oid]
 
-                # Get best CLOB snapshot at this timestamp
+                # Get latest CLOB snapshots at this timestamp
                 clob_list = clob_by_market.get(cid, [])
                 ptr = clob_ptrs.get(cid, 0)
-                while ptr + 1 < len(clob_list) and clob_list[ptr + 1]["ts_ms"] <= ts_ms:
+                while ptr < len(clob_list) and clob_list[ptr]["ts_ms"] <= ts_ms:
+                    snap = clob_list[ptr]
+                    side = "UP" if snap.get("token_id") == mkt.get("up_token_id") else "DOWN"
+                    latest_prices.setdefault(cid, {})[side] = OutcomeQuote(
+                        bid=float(snap.get("best_bid") or 0.0),
+                        ask=float(snap.get("best_ask") or 0.0),
+                        ask_size=float(snap.get("ask_size") or 999999.0),
+                    )
                     ptr += 1
                 clob_ptrs[cid] = ptr
-                if not clob_list:
+
+                prices_by_side = latest_prices.get(cid, {})
+                if not prices_by_side:
                     continue
-                snap = clob_list[ptr]
 
                 if vol <= 0 or not vol_calc.has_enough_data():
                     continue
@@ -162,6 +174,46 @@ class Simulator:
                     vol_annual=vol,
                     time_to_expiry_s=tte,
                 )
+                if strategy_mode == "signal":
+                    size = self._cfg.get("risk", {}).get("max_order_size_usdc", 5.0)
+                    prices = MarketPrices(
+                        up=prices_by_side.get("UP", OutcomeQuote()),
+                        down=prices_by_side.get("DOWN", OutcomeQuote()),
+                    )
+                    decision = signal_engine.decide(
+                        market_id=cid,
+                        up_token_id=mkt.get("up_token_id", ""),
+                        down_token_id=mkt.get("down_token_id", ""),
+                        fair_up=fair.fair_up,
+                        prices=prices,
+                        time_to_expiry_s=tte,
+                        default_size_usdc=size,
+                    )
+                    if decision.action != "SKIP":
+                        fill = SimFill(
+                            ts_ms=ts_ms,
+                            market_id=cid,
+                            side=decision.side or "",
+                            is_buy=True,
+                            price=decision.price,
+                            size=decision.size_usdc,
+                            fee=GAS_FEE,
+                        )
+                        result.fills.append(fill)
+                        inventory.record_fill(
+                            cid,
+                            symbol,
+                            decision.side or "",
+                            True,
+                            decision.size_usdc,
+                            decision.price,
+                        )
+                        signal_engine.mark_order_sent(cid)
+                        pnl -= GAS_FEE
+                        result.total_gas += GAS_FEE
+                    result.pnl_series.append(pnl)
+                    continue
+
                 inv_skew = inventory.inventory_skew(cid, symbol)
                 quotes = quote_engine.compute(
                     market_id=cid,
@@ -178,8 +230,9 @@ class Simulator:
                     continue
 
                 # Simulate fills: our bid >= CLOB best ask → we buy
-                clob_best_ask = float(snap.get("best_ask", 1.0))
-                clob_best_bid = float(snap.get("best_bid", 0.0))
+                up_quote = prices_by_side.get("UP", OutcomeQuote())
+                clob_best_ask = up_quote.ask
+                clob_best_bid = up_quote.bid
                 size = self._cfg.get("risk", {}).get("max_order_size_usdc", 5.0)
 
                 # UP BUY fill
@@ -243,8 +296,10 @@ class Simulator:
     async def _load_clob_snapshots(self, start: str, end: str, symbol: str) -> list[dict]:
         try:
             rows = await self._db.fetch(
-                "SELECT ts_ms, market_id, best_bid, best_ask FROM clob_snapshots "
-                "WHERE symbol=$1 AND ts_ms BETWEEN $2 AND $3 ORDER BY ts_ms",
+                "SELECT c.ts_ms, c.market_id, c.token_id, c.best_bid, c.best_ask "
+                "FROM clob_snapshots c "
+                "JOIN markets m ON m.condition_id = c.market_id "
+                "WHERE m.symbol=$1 AND c.ts_ms BETWEEN $2 AND $3 ORDER BY c.ts_ms",
                 symbol,
                 _date_to_ms(start),
                 _date_to_ms(end, end_of_day=True),
@@ -258,7 +313,7 @@ class Simulator:
         try:
             rows = await self._db.fetch(
                 "SELECT condition_id, symbol, start_price, start_time, end_time, "
-                "       duration_minutes, resolution_source "
+                "       duration_minutes, resolution_source, up_token_id, down_token_id "
                 "FROM markets WHERE symbol=$1 AND start_time >= $2 AND end_time <= $3",
                 symbol,
                 _date_to_ms(start),
@@ -301,8 +356,8 @@ def _dict_to_market(m: dict):
         question=m.get("question", ""),
         symbol=m.get("symbol", "BTC"),
         start_price=float(m.get("start_price", 0)),
-        up_token_id="",
-        down_token_id="",
+        up_token_id=m.get("up_token_id", ""),
+        down_token_id=m.get("down_token_id", ""),
         start_time=int(m.get("start_time", 0)),
         end_time=int(m.get("end_time", 0)),
         duration_minutes=int(m.get("duration_minutes", 15)),

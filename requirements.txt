@@ -11,3 +11,4 @@ py-clob-client==0.19.0
 colorlog==6.8.2
 rich==13.7.1
 click==8.1.7
+certifi>=2024.2.2

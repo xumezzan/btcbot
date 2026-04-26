@@ -118,7 +118,7 @@ async def run_collect(cfg: dict) -> None:
             m.start_time, m.end_time, m.duration_minutes,
             m.volume_24h, m.resolution_source, m.oracle_feed_id, m.active,
         ))
-        clob_feed.subscribe_market(m.condition_id, m.up_token_id)
+        clob_feed.subscribe_market(m.condition_id, m.up_token_id, m.down_token_id)
         await clob_feed.resubscribe()
         log.info("Subscribed to market: %s %s", m.symbol, m.question[:50])
 
@@ -149,10 +149,12 @@ async def run_trading(cfg: dict, dry_run: bool) -> None:
     from src.risk.risk_engine import RiskEngine
     from src.risk.adverse_selection import AdverseSelectionTracker
     from src.execution.clob_client import CLOBClient
+    from src.signals.value_signal import MarketPrices, OutcomeQuote, ValueSignalEngine
     from src.dashboard import Dashboard
 
     mode = "dryrun" if dry_run else "live"
-    log.info("Starting %s mode", mode.upper())
+    strategy_mode = cfg.get("strategy", {}).get("mode", "market_making")
+    log.info("Starting %s mode (%s strategy)", mode.upper(), strategy_mode)
 
     pool = await create_pool()
     clob = CLOBClient(cfg["execution"], dry_run=dry_run)
@@ -170,6 +172,7 @@ async def run_trading(cfg: dict, dry_run: bool) -> None:
             models[sym] = FairValueModel(cfg["fair_value"])
 
     quote_engine = QuoteEngine(cfg["quoting"])
+    signal_engine = ValueSignalEngine(cfg.get("signal", {}))
     inventory = InventoryManager()
     risk = RiskEngine(cfg["risk"])
     adverse = AdverseSelectionTracker()
@@ -178,9 +181,68 @@ async def run_trading(cfg: dict, dry_run: bool) -> None:
 
     active_markets: dict[str, MarketInfo] = {}
     current_spot: dict[str, float] = {}
+    market_prices: dict[str, dict[str, OutcomeQuote]] = {}
+    allow_taker = bool(cfg.get("signal", {}).get("allow_taker", False))
+    warned_taker_disabled: set[str] = set()
 
     # Per-market active order IDs: {market_id: {side: order_id}}
     active_orders: dict[str, dict] = {}
+
+    async def record_order(order, token_side: str | None) -> None:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO orders(order_id, market_id, token_id, side, token_side, price, size, status, dry_run, ts_ms, updated_ms) "
+                    "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) "
+                    "ON CONFLICT(order_id) DO UPDATE SET status=EXCLUDED.status, updated_ms=EXCLUDED.updated_ms",
+                    order.order_id,
+                    order.market_id,
+                    order.token_id,
+                    order.side,
+                    token_side,
+                    order.price,
+                    order.size,
+                    order.status,
+                    dry_run,
+                    order.ts_ms,
+                    int(time.time() * 1000),
+                )
+        except Exception:
+            log.exception("Failed to record order %s", getattr(order, "order_id", ""))
+
+    async def record_user_fill(fill, token_side: str, is_adverse: bool | None) -> None:
+        fill_id = getattr(fill, "fill_id", "") or f"{fill.order_id}:{fill.ts_ms}:{fill.token_id}:{fill.size}"
+        order_id = getattr(fill, "order_id", "") or None
+        try:
+            async with pool.acquire() as conn:
+                db_order_id = None
+                if order_id:
+                    exists = await conn.fetchval("SELECT 1 FROM orders WHERE order_id=$1", order_id)
+                    db_order_id = order_id if exists else None
+                await conn.execute(
+                    "INSERT INTO fills(fill_id, order_id, market_id, token_id, token_side, side, price, size, fee, ts_ms, is_adverse) "
+                    "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) "
+                    "ON CONFLICT(fill_id) DO NOTHING",
+                    fill_id,
+                    db_order_id,
+                    fill.market_id,
+                    fill.token_id,
+                    token_side,
+                    fill.side,
+                    fill.price,
+                    fill.size,
+                    fill.fee,
+                    fill.ts_ms,
+                    is_adverse,
+                )
+                if db_order_id:
+                    await conn.execute(
+                        "UPDATE orders SET status='FILLED', updated_ms=$1 WHERE order_id=$2",
+                        int(time.time() * 1000),
+                        db_order_id,
+                    )
+        except Exception:
+            log.exception("Failed to record fill %s", fill_id)
 
     async def on_spot_tick(tick: SpotTick) -> None:
         if not risk.is_alive():
@@ -258,6 +320,64 @@ async def run_trading(cfg: dict, dry_run: bool) -> None:
 
             size = risk.clamp_order_size(cfg["risk"]["max_order_size_usdc"])
 
+            if strategy_mode == "signal":
+                prices_by_side = market_prices.get(mkt.condition_id, {})
+                prices = MarketPrices(
+                    up=prices_by_side.get("UP", OutcomeQuote()),
+                    down=prices_by_side.get("DOWN", OutcomeQuote()),
+                )
+                decision = signal_engine.decide(
+                    market_id=mkt.condition_id,
+                    up_token_id=mkt.up_token_id,
+                    down_token_id=mkt.down_token_id,
+                    fair_up=fair.fair_up,
+                    prices=prices,
+                    time_to_expiry_s=tte,
+                    default_size_usdc=size,
+                )
+
+                if decision.action == "SKIP":
+                    log.debug("Signal skip %s: %s", mkt.condition_id[:12], decision.reason)
+                    continue
+
+                if not dry_run and not allow_taker:
+                    if mkt.condition_id not in warned_taker_disabled:
+                        log.warning(
+                            "Signal found %s edge=%.4f price=%.4f, but live taker execution is disabled",
+                            decision.action,
+                            decision.edge,
+                            decision.price,
+                        )
+                        warned_taker_disabled.add(mkt.condition_id)
+                    continue
+
+                existing = active_orders.get(mkt.condition_id, {})
+                if existing:
+                    await clob.cancel_all(mkt.condition_id)
+                    active_orders.pop(mkt.condition_id, None)
+
+                order = await clob.post_order(
+                    decision.token_id,
+                    mkt.condition_id,
+                    "BUY",
+                    decision.price,
+                    decision.size_usdc,
+                )
+                if order:
+                    active_orders[mkt.condition_id] = {"signal_buy": order.order_id}
+                    signal_engine.mark_order_sent(mkt.condition_id)
+                    await record_order(order, decision.side)
+                    log.info(
+                        "Signal %s %s price=%.4f fair=%.4f edge=%.4f size=$%.2f",
+                        decision.action,
+                        mkt.condition_id[:12],
+                        decision.price,
+                        decision.fair_probability,
+                        decision.edge,
+                        decision.size_usdc,
+                    )
+                continue
+
             # Cancel old orders and post new quotes
             existing = active_orders.get(mkt.condition_id, {})
             if existing:
@@ -285,8 +405,8 @@ async def run_trading(cfg: dict, dry_run: bool) -> None:
             if new_orders:
                 active_orders[mkt.condition_id] = new_orders
 
-    async def on_clob_fill(fill: FillEvent) -> None:
-        """Handle a fill notification from the CLOB websocket."""
+    async def process_user_fill(fill) -> None:
+        """Handle an authenticated user fill from the CLOB API."""
         if not risk.is_alive():
             return
         mkt = active_markets.get(fill.market_id)
@@ -297,19 +417,22 @@ async def run_trading(cfg: dict, dry_run: bool) -> None:
         side = "UP" if fill.token_id == mkt.up_token_id else "DOWN"
         is_buy = fill.side.upper() == "BUY"
 
+        fill_id = getattr(fill, "fill_id", "") or getattr(fill, "order_id", "")
         adverse.record_fill(
-            fill_id=fill.taker_order_id or fill.maker_order_id,
+            fill_id=fill_id,
             market_id=fill.market_id,
             token_side=side,
             price=fill.price,
             size=fill.size,
             ts_ms=fill.ts_ms,
         )
+        is_adverse = None
         inventory.record_fill(fill.market_id, mkt.symbol, side, is_buy, fill.size, fill.price)
 
         adv_rate = adverse.adverse_selection_rate()
         risk.check_adverse_selection(adv_rate)
         risk.check_net_delta(inventory.cross_asset_delta())
+        await record_user_fill(fill, side, is_adverse)
 
         dashboard.update(
             fills_today=dashboard._state["fills_today"] + 1,
@@ -318,9 +441,42 @@ async def run_trading(cfg: dict, dry_run: bool) -> None:
         log.info("Fill: %s %s token=%s price=%.4f size=%.2f", side, "BUY" if is_buy else "SELL",
                  fill.token_id[:12], fill.price, fill.size)
 
+    async def poll_user_fills() -> None:
+        """Poll authenticated user fills; public market trades are not our fills."""
+        seen_fill_ids: set[str] = set()
+        last_poll_ms = int(time.time() * 1000) - 60_000
+        while True:
+            if risk.is_alive():
+                fills = await clob.get_user_fills(after_ts_ms=last_poll_ms)
+                now_ms = int(time.time() * 1000)
+                for fill in fills:
+                    fill_key = fill.fill_id or f"{fill.order_id}:{fill.ts_ms}:{fill.token_id}:{fill.size}"
+                    if fill_key in seen_fill_ids:
+                        continue
+                    seen_fill_ids.add(fill_key)
+                    await process_user_fill(fill)
+                last_poll_ms = now_ms - 5_000
+            await asyncio.sleep(5)
+
+    async def on_clob_tick(tick: CLOBTick) -> None:
+        mkt = active_markets.get(tick.market_id)
+        if not mkt:
+            return
+
+        side = "UP" if tick.token_id == mkt.up_token_id else "DOWN"
+        ask_size = tick.asks[0].size if tick.asks else 0.0
+        market_prices.setdefault(tick.market_id, {})[side] = OutcomeQuote(
+            bid=tick.best_bid,
+            ask=tick.best_ask,
+            ask_size=ask_size,
+        )
+
+        if strategy_mode == "signal":
+            await _refresh_quotes(mkt.symbol)
+
     async def on_new_market(mkt: MarketInfo) -> None:
         active_markets[mkt.condition_id] = mkt
-        clob_feed.subscribe_market(mkt.condition_id, mkt.up_token_id)
+        clob_feed.subscribe_market(mkt.condition_id, mkt.up_token_id, mkt.down_token_id)
         await clob_feed.resubscribe()
 
     async def on_expired_market(mkt: MarketInfo) -> None:
@@ -336,7 +492,7 @@ async def run_trading(cfg: dict, dry_run: bool) -> None:
     binance.add_callback(on_spot_tick)
 
     clob_feed = PolymarketCLOBFeed(cfg["polymarket"])
-    clob_feed.add_fill_callback(on_clob_fill)
+    clob_feed.add_tick_callback(on_clob_tick)
 
     discovery = MarketDiscovery(
         cfg["polymarket"],
@@ -350,6 +506,7 @@ async def run_trading(cfg: dict, dry_run: bool) -> None:
         binance.run(),
         clob_feed.run(),
         discovery.run(),
+        poll_user_fills(),
     )
 
 
@@ -425,6 +582,9 @@ def main(mode, config, start, end, symbol):
         # Extra confirmation for live mode
         if not os.environ.get("POLY_PRIVATE_KEY"):
             log.critical("POLY_PRIVATE_KEY not set. Cannot start live trading.")
+            sys.exit(1)
+        if os.environ.get("I_ACCEPT_REAL_MONEY_RISK", "").strip().lower() != "yes":
+            log.critical("I_ACCEPT_REAL_MONEY_RISK=yes is required for live trading.")
             sys.exit(1)
         confirm = input(
             "\n⚠  You are starting LIVE trading mode. "

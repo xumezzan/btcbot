@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Polymarket CLOB websocket feed.
 
@@ -13,6 +15,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 
 import websockets
+
+from src.net.ssl import create_ssl_context
 
 log = logging.getLogger(__name__)
 
@@ -59,8 +63,8 @@ class PolymarketCLOBFeed:
     - Receive: book snapshots (type=book) and price level updates (type=price_change)
     - Also subscribe to "last_trade_price" channel for fills
 
-    Note: Each market has two tokens (YES/UP and NO/DOWN). We subscribe to
-    the YES/UP token_id; the other side is implied (1 - price).
+    Each market has two tokens (YES/UP and NO/DOWN). Subscribe to both when
+    execution logic needs executable prices for both outcomes.
     """
 
     def __init__(self, cfg: dict):
@@ -73,15 +77,25 @@ class PolymarketCLOBFeed:
         self._ws = None
         self._running = False
 
-    def subscribe_market(self, market_id: str, up_token_id: str) -> None:
-        self._token_ids.add(up_token_id)
-        self._market_for_token[up_token_id] = market_id
-        self._books[up_token_id] = {"bids": {}, "asks": {}}
+    def subscribe_market(self, market_id: str, up_token_id: str, down_token_id: str | None = None) -> None:
+        token_ids = [up_token_id]
+        if down_token_id:
+            token_ids.append(down_token_id)
 
-    def unsubscribe_market(self, up_token_id: str) -> None:
-        self._token_ids.discard(up_token_id)
-        self._market_for_token.pop(up_token_id, None)
-        self._books.pop(up_token_id, None)
+        for token_id in token_ids:
+            self._token_ids.add(token_id)
+            self._market_for_token[token_id] = market_id
+            self._books[token_id] = {"bids": {}, "asks": {}}
+
+    def unsubscribe_market(self, up_token_id: str, down_token_id: str | None = None) -> None:
+        token_ids = [up_token_id]
+        if down_token_id:
+            token_ids.append(down_token_id)
+
+        for token_id in token_ids:
+            self._token_ids.discard(token_id)
+            self._market_for_token.pop(token_id, None)
+            self._books.pop(token_id, None)
 
     def add_tick_callback(self, fn: Callable[[CLOBTick], Awaitable[None]]) -> None:
         self._tick_callbacks.append(fn)
@@ -205,7 +219,12 @@ class PolymarketCLOBFeed:
     async def _run_once(self) -> None:
         url = self._cfg.get("ws_url", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
         log.info("Connecting to Polymarket CLOB WS")
-        async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+        async with websockets.connect(
+            url,
+            ping_interval=20,
+            ping_timeout=10,
+            ssl=create_ssl_context(),
+        ) as ws:
             self._ws = ws
             await self._subscribe(ws)
             log.info("Polymarket CLOB websocket connected")

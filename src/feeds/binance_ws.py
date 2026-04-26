@@ -14,6 +14,8 @@ from typing import Callable, Awaitable
 
 import websockets
 
+from src.net.ssl import create_ssl_context
+
 log = logging.getLogger(__name__)
 
 
@@ -127,7 +129,12 @@ class BinanceFeed:
         url = self._build_stream_url()
         delay = self._cfg.get("reconnect_delay_seconds", 5)
         log.info("Connecting to Binance: %s", url)
-        async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+        async with websockets.connect(
+            url,
+            ping_interval=20,
+            ping_timeout=10,
+            ssl=create_ssl_context(),
+        ) as ws:
             log.info("Binance websocket connected")
             async for raw in ws:
                 await self._handle_message(raw)
